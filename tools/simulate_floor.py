@@ -115,7 +115,8 @@ def main():
     while True:
         for name in SETUPS:
             size = next_size_units(name)
-            jpeg = make_part_image(size)
+            # tool wear changes ONE dimension (length); height stays constant
+            jpeg = make_part_image(size, aspect=0.6 * REFERENCE_SIZE_UNITS / size)
             try:
                 r = post_inspection(args.hub.rstrip('/'), api_keys[name], jpeg)
                 err = r.get('error_pct')

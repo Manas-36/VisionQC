@@ -347,6 +347,7 @@ function showToast(title, body) {
   const b = document.createElement('div'); b.className = 't-body'; b.textContent = body;
   toast.append(t, b);
   stack.appendChild(toast);
+  while (stack.children.length > 3) stack.firstChild.remove();     // never bury the dashboard in alerts
   setTimeout(() => toast.remove(), 6000);
 }
 

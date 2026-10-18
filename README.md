@@ -4,6 +4,15 @@
 
 Final-year RBL project, Mechatronics Engineering, TCET Mumbai.
 
+## Screenshots
+Generated from the built-in floor simulator (synthetic parts), not real hardware.
+
+![Live dashboard](docs/images/dashboard.png)
+
+| Capture a reference from the camera | Admin: cameras + hub address | Phone view |
+|---|---|---|
+| <img src="docs/images/capture-preview.png" width="320"> | <img src="docs/images/admin.png" width="320"> | <img src="docs/images/dashboard-mobile.png" width="200"> |
+
 ## Features
 - **Admin-managed** - add machines and cameras from the dashboard; reassign cameras between machines any time.
 - **Reference-photo comparison** - the first good part defines the standard; later parts are scored as % error against the machine's tolerance. No calibration needed.
