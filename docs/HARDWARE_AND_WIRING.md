@@ -1,136 +1,132 @@
-# Hardware & Electrical Setup — Wireless Inspection Cameras
+# Hardware & Electrical Guide (v2)
 
-This covers the physical camera side: what to buy, how to wire it, and
-where to mount it at each machine's output. The hub software (running on
-a PC/server) doesn't need any special hardware beyond a normal computer
-on your factory network.
+This replaces the first version, which was too optimistic. Read **section 1 first**: a vision gauge is
+mostly a *lighting and mounting* problem, and only secondly a camera/software problem.
 
-There are two ways to get a camera talking to the hub. Pick per-machine —
-you can mix both across your floor.
+## 1. Ground rules (what actually decides accuracy)
 
----
+1. **Light it from behind (backlight).** For a width/length measurement, a diffuse LED panel under or
+   behind the part turns it into a crisp black silhouette. Ambient or front lighting gives shadows and
+   reflections that move the detected edge by several pixels. A backlight is the single biggest upgrade.
+2. **Constant light.** Use a DC-driven panel (no visible PWM flicker) and a shroud/hood that blocks
+   room light and sunlight. Optionally lock exposure in firmware (`LOCK_EXPOSURE 1`).
+3. **Rigid, repeatable geometry.** Camera and part position must be identical every time: aluminium
+   profile mount, part guides/fixture so the part always sits in the same spot, camera perpendicular
+   to the stage. The software compares against a reference taken from *this exact camera position*; if the
+   camera is bumped, every reading shifts (the hub now warns "check the camera" when length and width
+   change together).
+4. **Stationary part when the shutter fires.** The OV2640 is a rolling-shutter sensor: a moving part is
+   blurred and skewed. Use *stop-and-shoot*, a slow belt (< ~0.1 m/s) with the photo-eye trigger
+   **and** a short exposure, or a strobed backlight. A free-running timer on a moving conveyor
+   photographs half-parts and empty belt - use the sensor trigger on a real line, timer only on the bench.
+5. **Know your resolution.** mm/pixel = field-of-view width / image width. Example: 100 mm field on
+   SXGA (1280 px) -> 0.078 mm/px. Edge position is realistically good to ~0.3-0.5 px, so repeatability
+   is roughly +/-0.03-0.05 mm and a *usable tolerance is about +/-0.3 mm or looser*. Do **not** claim
+   +/-0.05 mm with this hardware. The dashboard's **Cpk badge / `/api/cameras/{id}/capability`** measures
+   this for your actual set-up: leave one part untouched, run 30 shots, and check that 6 sigma is below
+   ~30 % of the tolerance band.
+6. **Lens distortion and perspective.** The stock OV2640 lens has barrel distortion and parts with
+   height look bigger when closer to the lens. Always place the part in the same, central spot; keep the
+   camera as far away as resolution allows; measure parts of the same height.
 
-## Option A — ESP32-CAM (recommended: fully wireless, ~Rs.500–800 per unit)
+## 2. Parts list (per inspection station)
 
-A postage-stamp-sized board with a camera and WiFi built in. No PC needed
-at the machine at all — it talks straight to the hub over WiFi. Firmware
-is provided in `firmware/esp32cam/esp32cam.ino`.
+Prices are rough Indian-market estimates; check current listings.
 
-### Parts list (per camera)
+| # | Item | Approx. Rs | Why |
+|---|------|-----------|-----|
+| 1 | Seeed XIAO ESP32S3 **Sense** (camera board attached) | 2,200-3,000 | Camera + WiFi, 8 MB PSRAM. USB-C, no FTDI needed |
+| 2 | U.FL / IPEX antenna (ships with the board) | incl. | **Must be fitted** - on-board range is poor, metal machines make it worse |
+| 3 | LED **backlight panel**, diffuse, ~A5, 12 V | 400-900 | Silhouette lighting (section 1) |
+| 4 | 12 V 1-2 A regulated DC supply for the panel | 200-350 | Low-ripple, no PWM dimmer |
+| 5 | **Photo-eye / break-beam sensor** (3.3-5 V IR module for bench; NPN/PNP industrial photoelectric for a line) | 150-1,500 | Triggers one photo per part |
+| 6 | PC817 (or similar) opto-isolator + 2.2 k and 10 k resistors | 20-40 | Isolate any 12/24 V sensor from the 3.3 V GPIO |
+| 7 | 24 V DIN PSU (if the line is 24 V) + 24 V -> 5 V / 2 A DC-DC converter | 800-1,500 | Camera supply from plant power |
+| 8 | 1 A fuse + holder, SMBJ33A TVS diode (24 V rail) | 50-100 | Protect against shorts/transients |
+| 9 | 20x20 aluminium profile + brackets (or sturdy 3D-printed mount) | 300-800 | Rigid, repeatable geometry |
+| 10 | Black hood / shroud (matte black card, ABS, or 3D-print) | 100-300 | Block ambient light |
+| 11 | Thread-lock / lens-lock ring | 20 | The focus ring must not drift |
+| 12 | Enclosure (IP54 box with window) | 300-600 | Dust / coolant splash |
+| 13 | Known-size reference part or gauge block / calliper-measured sample | - | Calibrates mm/pixel and gives the "golden sample" |
+| 14 | Dedicated 2.4 GHz WiFi router / AP (not a phone) | 1,200-2,500 | See section 5 |
 
-| # | Item | Approx. price (₹) | Notes |
-|---|------|------|-------|
-| 1 | ESP32-CAM (AI-Thinker board, OV2640 sensor) | 450–650 | The camera module itself |
-| 2 | FTDI / USB-to-serial programmer (3.3V/5V) | 120–200 | Only needed once, to flash the firmware — can be shared across all cameras |
-| 3 | 5V / 1A (minimum) regulated power supply | 100–200 | A phone charger works; see power note below |
-| 4 | 1000µF electrolytic capacitor | 5–15 | Across the 5V/GND supply pins — prevents brownout resets during WiFi transmission |
-| 5 | Dupont jumper wires (F-F and M-F) | 30–50 | For FTDI-to-board programming connections |
-| 6 | Small enclosure or 3D-printed mount | 100–300 | Weatherproofing/dust protection for a factory floor |
-| 7 | LED ring light (optional, if not using the onboard flash) | 300–500 | Better, more even illumination than the onboard LED for consistent measurements |
-| 8 | Momentary push button (optional) | 10–20 | Manual "inspect now" trigger, wired to GPIO13 + GND |
+Bench/demo version: items 1, 2, a cheap backlight, a 5 V IR break-beam module, USB power bank. ~Rs 3,500.
 
-### Electrical connections
+## 3. Wiring
 
-**Programming (one-time, per board, using the FTDI adapter):**
+### 3.1 Camera power
+```
+ 24 V DIN PSU --[1 A fuse]--+--[SMBJ33A TVS to GND]
+                            |
+                      24V->5V buck (>= 2 A) --> XIAO 5V pin (or USB-C)
+                                          GND --> XIAO GND
+```
+The XIAO + camera + WiFi can pull ~400 mA peaks; use a >= 1 A supply with short, thick wires. A thin
+long USB cable causes brown-out resets (visible as the board rebooting when it transmits). Add 470-1000 uF
+across 5V/GND at the board.
 
-| ESP32-CAM pin | FTDI adapter pin |
-|---|---|
-| 5V | 5V |
-| GND | GND |
-| U0R (RX) | TX |
-| U0T (TX) | RX |
-| GPIO0 | GND (bridge this only while flashing — remove after) |
+### 3.2 Trigger sensor -> D1 (GPIO2)
+D1 is **3.3 V logic with an internal pull-up**; the firmware fires when D1 goes **LOW**. Never connect 12/24 V.
 
-After wiring, plug the FTDI into your PC, select the correct COM port and
-"AI Thinker ESP32-CAM" board in Arduino IDE, and upload
-`esp32cam_client.ino` with your WiFi/hub details filled in. Then
-disconnect the GPIO0-GND bridge and power-cycle the board — it now runs
-standalone.
+**a) 3.3/5 V IR break-beam module (bench):**
+```
+ module VCC -> 3V3     module GND -> GND     module OUT -> D1
+```
+Use a module whose OUT is open-collector / goes LOW when the beam is blocked.
 
-**Normal operation (no PC involved):**
+**b) 24 V industrial sensor through an opto-isolator (line):**
+```
+ 24 V PNP sensor OUT --[2.2 k]--> PC817 pin1 (anode)       PC817 pin2 (cathode) --> 24 V GND
+ PC817 pin4 (collector) --> XIAO D1          PC817 pin3 (emitter) --> XIAO GND
+```
+Sensor active -> opto conducts -> D1 pulled LOW -> photo. (For an NPN sensor feed the LED from +24 V
+through 2.2 k and let the sensor sink the cathode.) The two grounds stay separate - that is the point.
 
-| ESP32-CAM pin | Connects to |
-|---|---|
-| 5V | Positive rail of your 5V/1A supply |
-| GND | Negative rail of your 5V supply |
-| GPIO13 (optional) | One leg of the push button; other leg to GND |
-| GPIO4 | Internal, drives the onboard flash LED automatically — no wiring needed |
+### 3.3 Backlight
+12 V supply -> panel, on its own supply. Do not power it from the 5 V camera rail.
 
-**Power note:** the ESP32-CAM draws short current spikes (~300mA) while
-transmitting over WiFi. A weak or long, thin USB cable causes voltage
-sag and random resets ("brownout"). Use a proper 5V/1A+ supply as close
-to the board as practical, and add the 1000µF capacitor across 5V/GND
-right at the board if you see it restarting unexpectedly.
+### 3.4 Programming
+USB-C cable straight to the laptop. If upload fails: hold **B**, tap **R**, release B, upload again.
 
-### Mounting
+## 4. Mechanical layout
+```
+        [XIAO camera]  <- rigid arm, looking straight down, lens locked
+             |
+        (hood / shroud)
+             |
+   ---- part on stage, in a guide/fixture ----
+        [ diffuse LED backlight panel ]
+   photo-eye across the stage, just before the part's stopping position
+```
+Mount at the machine **output**; the part should stop (or be nearly still) in the frame for ~150 ms.
 
-- Mount at the machine's **output side** (conveyor exit, ejection chute,
-  or inspection tray) — wherever the finished part naturally comes to
-  rest or passes through, per your original plan.
-- Lens pointing straight down (perpendicular) at a fixed platform/tray —
-  just like the RBL benchtop prototype, consistent geometry matters more
-  than the camera being fancy.
-- Keep the same distance and angle every time you re-capture a reference
-  photo, or the reference measurement stops being comparable to later
-  captures. If you ever move the camera, re-capture the reference.
-- Add a plain, high-contrast background (a piece of matte card) behind/
-  under the part in the camera's view, same as the earlier build guide —
-  this is still the single biggest factor in reliable edge detection.
-- Route the WiFi antenna (small onboard trace or external if your module
-  has a u.FL connector) away from large metal machine bodies where
-  possible — metal enclosures can weaken WiFi signal noticeably.
+## 5. Network & operations
+- Use a **dedicated 2.4 GHz router/AP** on channel 1, 6 or 11, WPA2. The ESP32 cannot use 5 GHz. A phone
+  hotspot is fine for a demo only - it changes IPs and sleeps.
+- Give the hub PC a **DHCP reservation (fixed IP)** and use that as `HUB_URL`. Hub on Ethernet, on a UPS.
+- Run the hub as a service (`deploy/visionqc.service` on Linux; NSSM or Task Scheduler on Windows) so a
+  reboot does not silently stop inspection. The dashboard now alerts when a camera goes offline.
+- Set `VISIONQC_ADMIN_PASSWORD`. Keep the network closed: camera traffic is plain HTTP. Put the hub behind
+  an HTTPS reverse proxy (e.g. Caddy) if it must cross an untrusted network.
+- Signal check: Serial Monitor prints RSSI at connect; better than -70 dBm is acceptable.
 
----
+## 6. Commissioning checklist
+1. Fit antenna; fix camera mount; set focus on the part plane; lock the lens.
+2. Backlight on, hood on. The silhouette should be solid black, edges sharp.
+3. Place a known part, **Capture photo** -> check preview -> enter its real length/width in mm -> **Use as reference**.
+4. Repeatability: leave the part, set auto-test "every 2 s" for ~1 min. Read **Cpk** / 6-sigma. Only enforce
+   tolerances your gauge can resolve (6 sigma <= ~30 % of the +/-tolerance band).
+5. Switch to **on sensor**, run 20 parts, confirm one photo per part and no empty-frame alerts.
+6. Re-do step 3 after *any* bump of the camera, lens or lighting.
 
-## Option B — Phone-as-camera or laptop webcam (fastest to get started, no soldering)
+## 7. Limits you should state in the report
+- Two dimensions of one silhouette (length x width); no height, holes, threads or surface defects.
+- Not calibrated for lens distortion; accuracy only valid for parts placed where the reference was taken.
+- Inspection is advisory: the system alerts, it does not reject or stop the machine. Do not use it as a
+  safety device. A reject actuator (diverter/relay) is future work.
+- For tighter tolerances or fast conveyors, move to a global-shutter industrial camera with telecentric lens
+  and strobed backlight (e.g. Raspberry Pi + Global Shutter camera as the next step).
 
-Good for a pilot/demo on one or two machines before committing to
-ESP32-CAM hardware everywhere.
-
-- **Laptop/mini-PC + USB webcam**, running `machine_node/node_client.py`.
-  Wired or WiFi network connection to the hub, whichever the machine's
-  location allows.
-- **Old Android phone** running an IP-camera app (e.g. "IP Webcam") —
-  mount the phone itself at the output side, and instead of
-  `node_client.py` capturing from a local USB webcam, you can adapt it to
-  pull the phone's MJPEG stream over WiFi (ask if you'd like this
-  variant of the script — it's a small change).
-
-This path has zero electrical wiring — just power (a phone charger or
-laptop's own battery/adapter) and WiFi. It's the right choice for
-proving the concept on one line before investing in ESP32-CAM units
-across the whole floor.
-
----
-
-## Network requirements (either option)
-
-- All cameras and the hub PC must be on the **same local network**
-  (same WiFi router/switch, or routed together) so the camera can reach
-  the hub's IP address and port 8000.
-- Give the hub PC a **static local IP** (or a DHCP reservation on your
-  router) — if its IP changes, every camera's `HUB_URL` needs updating.
-  Check your router's admin page for "DHCP reservation" or "static
-  lease" to set this once.
-- No internet connection is required — this all runs on your local
-  factory network. If you do want remote access (checking the dashboard
-  from off-site), that needs additional setup (port forwarding + a
-  security review) which isn't included here.
-
----
-
-## Quick reference: from unboxing to first inspection
-
-1. Start the hub (`python -m uvicorn app:app --host 0.0.0.0 --port 8000`).
-2. On the dashboard: **Admin -> Machines -> Add machine** (give it a
-   name, location, and max error %).
-3. **Admin -> Cameras -> Add camera**, assign it to that machine. Copy
-   the generated API key (`CAM-XXXXXX`) shown when it's created.
-4. Wire and flash an ESP32-CAM with that API key (or set up a webcam +
-   `node_client.py --api-key CAM-XXXXXX`).
-5. Power on the camera at the machine. Place a known-good part in view
-   and click **"Set reference part"** on that camera's card (or run
-   `node_client.py --api-key CAM-XXXXXX --hub <url> --set-reference --camera-id <numeric id>`).
-6. From then on, every part that camera photographs is compared against
-   its own reference automatically, with the % error and diagnosis shown
-   live on the dashboard.
+## 8. Legacy: AI-Thinker ESP32-CAM
+Still supported by `firmware/esp32cam/esp32cam.ino` (timer upload only, no remote capture/sensor mode). It
+needs an FTDI adapter (GPIO0->GND while flashing), a clean 5 V/1 A supply, and its antenna is weaker. Prefer the XIAO.

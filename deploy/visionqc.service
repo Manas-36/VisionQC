@@ -1,0 +1,15 @@
+# Linux: sudo cp deploy/visionqc.service /etc/systemd/system/ && sudo systemctl enable --now visionqc
+[Unit]
+Description=VisionQC hub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/opt/VisionQC/hub
+Environment=VISIONQC_ADMIN_PASSWORD=change-me
+ExecStart=/usr/bin/python3 -m uvicorn app:app --host 0.0.0.0 --port 8000
+Restart=always
+User=visionqc
+
+[Install]
+WantedBy=multi-user.target

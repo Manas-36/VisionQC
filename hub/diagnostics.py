@@ -31,11 +31,18 @@ def _pct_error(measured, reference):
     return round(100 * (measured - reference) / reference, 3)
 
 
-def _run_length(history: List[float]) -> int:
-    """How many of the most recent error% readings are on the same side of zero?"""
+# Readings smaller than this fraction of the tolerance are treated as
+# measurement noise: they neither start nor extend a "drift" run. Without
+# this, 7 readings of +0.02 % (pure noise) would be reported as drift.
+NOISE_DEADBAND_FRACTION = 0.25
+
+
+def _run_length(history: List[float], deadband: float = 0.0) -> int:
+    """How many of the most recent error% readings are on the same side of zero
+    (ignoring readings inside the noise deadband)?"""
     if not history:
         return 0
-    sign = lambda v: 1 if v > 0 else (-1 if v < 0 else 0)
+    sign = lambda v: 1 if v > deadband else (-1 if v < -deadband else 0)
     last_sign = sign(history[-1])
     if last_sign == 0:
         return 0
@@ -48,7 +55,7 @@ def _run_length(history: List[float]) -> int:
     return run
 
 
-def diagnose(width_px: Optional[float], height_px: Optional[float],
+def _diagnose_core(width_px: Optional[float], height_px: Optional[float],
              ref_width_px: Optional[float], ref_height_px: Optional[float],
              max_error_percent: float, history_error_pct: List[float],
              vision_error: Optional[str]) -> Diagnosis:
@@ -80,7 +87,7 @@ def diagnose(width_px: Optional[float], height_px: Optional[float],
     result = "PASS" if in_tolerance else "FAIL"
 
     combined_history = history_error_pct + [signed_error]
-    run_length = _run_length(combined_history)
+    run_length = _run_length(combined_history, deadband=NOISE_DEADBAND_FRACTION * max_error_percent)
 
     if in_tolerance and run_length < TREND_RUN_LENGTH:
         return Diagnosis(
@@ -134,3 +141,48 @@ def diagnose(width_px: Optional[float], height_px: Optional[float],
                         "machine if the next part also fails.",
         severity="critical",
     )
+
+
+def _looks_like_scale_change(w_err, h_err, tol) -> bool:
+    """Both dimensions moved the same way by a similar amount -> the camera moved
+    closer/further or refocused, rather than the part itself changing (a real
+    tooling fault rarely scales length and width together)."""
+    if w_err is None or h_err is None:
+        return False
+    if abs(w_err) < 0.5 * tol or abs(h_err) < 0.5 * tol:
+        return False
+    if (w_err > 0) != (h_err > 0):
+        return False
+    ratio = abs(w_err) / abs(h_err)
+    return 0.7 <= ratio <= 1.43
+
+
+def diagnose(width_px, height_px, ref_width_px, ref_height_px, max_error_percent,
+             history_error_pct, vision_error) -> Diagnosis:
+    d = _diagnose_core(width_px, height_px, ref_width_px, ref_height_px, max_error_percent,
+                       history_error_pct, vision_error)
+    if d.result == "FAIL" and _looks_like_scale_change(d.width_error_pct, d.height_error_pct, max_error_percent):
+        d.diagnosis += " Length and width changed by about the same percentage."
+        d.recommendation = ("FIRST check the camera: that pattern usually means the camera moved, was bumped, or "
+                            "changed focus (everything looks bigger/smaller), not that the part changed. "
+                            "If the mount is fine, re-set the reference; otherwise: " + d.recommendation)
+    return d
+
+
+def process_capability(errors: List[float], tol_pct: float, min_n: int = 10) -> dict:
+    """Mean, spread and Cp/Cpk of a series of % errors against the +/- tolerance.
+    Returns None-valued fields until there are enough readings."""
+    n = len(errors)
+    out = {"n": n, "mean": None, "sigma": None, "cp": None, "cpk": None, "six_sigma_pct_of_band": None}
+    if n < min_n:
+        return out
+    mean = sum(errors) / n
+    var = sum((e - mean) ** 2 for e in errors) / (n - 1)
+    sigma = var ** 0.5
+    out["mean"], out["sigma"] = round(mean, 4), round(sigma, 4)
+    if sigma > 1e-9:
+        out["cp"] = round(tol_pct / (3 * sigma), 2)
+        out["cpk"] = round((tol_pct - abs(mean)) / (3 * sigma), 2)
+        # share of the +/-tol band eaten by 6 sigma of spread (gauge-quality check: want <= ~30 %)
+        out["six_sigma_pct_of_band"] = round(100 * (6 * sigma) / (2 * tol_pct), 1)
+    return out

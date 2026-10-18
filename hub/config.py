@@ -31,3 +31,18 @@ TREND_RUN_LENGTH = 6
 # Default max allowed error (%) for a newly created machine, if the admin
 # doesn't set one explicitly.
 DEFAULT_MAX_ERROR_PERCENT = 3.0
+
+# --- Security -----------------------------------------------------------
+# If set, the dashboard and all admin API calls require HTTP Basic auth
+# (any username, this password). Cameras are unaffected: they authenticate
+# with their own api_key. Leave unset ONLY for a closed demo network.
+ADMIN_PASSWORD = os.environ.get("VISIONQC_ADMIN_PASSWORD") or None
+
+# Largest accepted photo upload.
+MAX_UPLOAD_BYTES = 6 * 1024 * 1024
+
+# --- Storage retention ----------------------------------------------------
+# Image files of PASS parts are deleted after this many days; FAIL/ERROR images
+# are kept longer as evidence. The measurement rows themselves are never deleted.
+RETENTION_DAYS_PASS = int(os.environ.get("VISIONQC_RETENTION_DAYS_PASS", 30))
+RETENTION_DAYS_FAIL = int(os.environ.get("VISIONQC_RETENTION_DAYS_FAIL", 180))

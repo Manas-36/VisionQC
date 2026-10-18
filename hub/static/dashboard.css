@@ -211,3 +211,9 @@ p.empty-state { color: var(--text-mute); font-size: 13px; }
 .switch-label { display:flex; align-items:center; gap:6px; cursor:pointer; }
 .interval-input { width:56px; background:var(--panel-2); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:4px 6px; font-family:var(--font-mono); font-size:11px; }
 .hint { color:var(--text-mute); font-size:12px; }
+.mm-line { font-family:var(--font-mono); font-size:13px; color:var(--text); margin-top:4px; }
+.cpk { padding:1px 6px; border-radius:4px; font-family:var(--font-mono); font-size:10.5px; border:1px solid var(--border); }
+.cpk.good { color:var(--pass); border-color:var(--pass); }
+.cpk.ok { color:var(--accent); border-color:var(--accent); }
+.cpk.bad { color:#ef4444; border-color:#ef4444; }
+.cpk.none { color:var(--text-mute); }

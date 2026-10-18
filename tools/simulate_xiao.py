@@ -27,7 +27,9 @@ while True:
         print("preview sent", r.status_code)
     if p["auto_enabled"] and not wasauto: last_auto = 0
     wasauto = p["auto_enabled"]
-    if p["auto_enabled"] and p["assigned"] and p["has_reference"] and time.time() - last_auto >= p["auto_interval_sec"]:
+    # (in "sensor" mode a real camera fires on the photo-eye; here we just pretend a part arrives every 5 s)
+    interval = 5 if p.get("mode") == "sensor" else p["auto_interval_sec"]
+    if p["auto_enabled"] and p["assigned"] and p["has_reference"] and time.time() - last_auto >= interval:
         last_auto = time.time(); n += 1
         w = 220 + n * 1.5                                  # slow drift
         r = requests.post(f"{a.hub}/api/inspect", data={"api_key": a.api_key}, files={"image": ("p.jpg", part_image(w), "image/jpeg")})

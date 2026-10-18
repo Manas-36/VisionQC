@@ -16,11 +16,18 @@ Design (matches database.py / vision.py / diagnostics.py):
     and scores it as a % error, checked against its machine's tolerance.
 """
 
+import asyncio
+import base64
+import hmac
+import logging
+import socket
 import time
+from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconnect, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconnect, HTTPException, Request
+from starlette.concurrency import run_in_threadpool
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 import os
 import secrets
@@ -29,10 +36,111 @@ import json
 import database as db
 import vision
 import diagnostics
-from config import IMAGE_DIR, CAMERA_OFFLINE_TIMEOUT_SEC, TREND_WINDOW_SIZE, DEFAULT_MAX_ERROR_PERCENT
+from config import (IMAGE_DIR, CAMERA_OFFLINE_TIMEOUT_SEC, TREND_WINDOW_SIZE, DEFAULT_MAX_ERROR_PERCENT,
+                    ADMIN_PASSWORD, MAX_UPLOAD_BYTES, RETENTION_DAYS_PASS, RETENTION_DAYS_FAIL)
 
-app = FastAPI(title="VisionQC Hub", version="1.0.0")
+log = logging.getLogger("visionqc")
 db.init_db()
+
+_online_state = {}          # camera_id -> was online at last check
+
+
+async def check_offline(now=None):
+    """Broadcast a 'camera_offline' event the moment a camera that was online stops reporting."""
+    now = now or time.time()
+    for c in db.list_cameras():
+        online = bool(c["last_seen"]) and (now - c["last_seen"]) < CAMERA_OFFLINE_TIMEOUT_SEC
+        was = _online_state.get(c["id"])
+        _online_state[c["id"]] = online
+        if was and not online:
+            machine = db.get_machine(c["machine_id"]) if c["machine_id"] else None
+            await manager.broadcast({"type": "camera_offline", "camera_id": c["id"], "camera_name": c["name"],
+                                     "machine_name": machine["name"] if machine else None})
+            await manager.broadcast({"type": "state_changed"})
+
+
+async def _background_jobs():
+    last_prune = 0.0
+    while True:
+        try:
+            await check_offline()
+            if time.time() - last_prune > 6 * 3600:
+                last_prune = time.time()
+                n = await run_in_threadpool(db.prune_images, RETENTION_DAYS_PASS, RETENTION_DAYS_FAIL, IMAGE_DIR)
+                if n:
+                    log.info("Retention: removed %d old image files", n)
+        except Exception:
+            log.exception("background job failed")
+        await asyncio.sleep(10)
+
+
+@asynccontextmanager
+async def lifespan(_app):
+    if not ADMIN_PASSWORD:
+        log.warning("VISIONQC_ADMIN_PASSWORD is not set: the dashboard and admin API are OPEN to anyone "
+                    "on the network. Fine for a closed demo; set it before real use.")
+    task = asyncio.create_task(_background_jobs())
+    yield
+    task.cancel()
+
+
+app = FastAPI(title="VisionQC Hub", version="1.1.0", lifespan=lifespan)
+
+# ---------------------------------------------------------------- security
+# Cameras use their api_key (device endpoints + /api/inspect). Everything else
+# (dashboard, admin API, stored images) needs the admin password when one is set.
+_PUBLIC_PREFIXES = ("/api/device/", "/api/inspect", "/health")
+
+
+def _basic_auth_ok(header: Optional[str]) -> bool:
+    if not ADMIN_PASSWORD:
+        return True
+    if not header or not header.lower().startswith("basic "):
+        return False
+    try:
+        supplied = base64.b64decode(header[6:]).decode("utf-8", "replace").split(":", 1)[1]
+    except Exception:
+        return False
+    return hmac.compare_digest(supplied.encode(), ADMIN_PASSWORD.encode())
+
+
+@app.middleware("http")
+async def require_admin(request: Request, call_next):
+    if request.url.path.startswith(_PUBLIC_PREFIXES) or _basic_auth_ok(request.headers.get("authorization")):
+        return await call_next(request)
+    return Response("Admin password required", status_code=401,
+                    headers={"WWW-Authenticate": 'Basic realm="VisionQC"'})
+
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+
+def _hub_lan_ip() -> str:
+    """The laptop/server's IP on the interface that reaches the network (no packet is sent)."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("10.255.255.255", 1))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
+@app.get("/api/hub-info")
+def hub_info(request: Request):
+    port = request.url.port or 8000
+    return {"lan_ip": _hub_lan_ip(), "port": port, "camera_hub_url": f"http://{_hub_lan_ip()}:{port}",
+            "auth_enabled": ADMIN_PASSWORD is not None}
+
+
+async def _read_upload(image: UploadFile) -> bytes:
+    data = await image.read(MAX_UPLOAD_BYTES + 1)
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, f"Image larger than {MAX_UPLOAD_BYTES // (1024 * 1024)} MB")
+    return data
 
 
 class ConnectionManager:
@@ -63,6 +171,9 @@ manager = ConnectionManager()
 
 @app.websocket("/ws")
 async def ws_endpoint(websocket: WebSocket):
+    if not _basic_auth_ok(websocket.headers.get("authorization")):
+        await websocket.close(code=1008)
+        return
     await manager.connect(websocket)
     try:
         while True:
@@ -85,6 +196,9 @@ def _camera_public(c: dict, now: float) -> dict:
     c["has_preview"] = c.get("preview_image_path") is not None
     c["auto_enabled"] = bool(c.get("auto_enabled"))
     c["latest"] = db.latest_inspection(c["id"])
+    c["mm_per_px"] = (c["nominal_width_mm"] / c["reference_width_px"]
+                      if c.get("nominal_width_mm") and c.get("reference_width_px") else None)
+    c["capability"] = _capability(c, 30)
     c["stats"] = db.camera_stats(c["id"])
     return c
 
@@ -125,6 +239,26 @@ async def remove_machine(machine_id: int):
     return {"ok": True}
 
 
+def _worst_error(r):
+    we, he = r["width_error_pct"], r["height_error_pct"]
+    if we is None and he is None:
+        return None
+    return we if abs(we or 0) >= abs(he or 0) else he
+
+
+def _capability(camera: dict, n: int) -> dict:
+    """Spread / Cpk of the camera's last n readings vs its machine tolerance."""
+    machine = db.get_machine(camera["machine_id"]) if camera.get("machine_id") else None
+    tol = machine["max_error_percent"] if machine else DEFAULT_MAX_ERROR_PERCENT
+    rows = [r for r in db.recent_inspections(camera["id"], n) if r["result"] in ("PASS", "FAIL")]
+    out = {"tolerance_pct": tol}
+    for key, col in (("width", "width_error_pct"), ("height", "height_error_pct")):
+        out[key] = diagnostics.process_capability([r[col] for r in rows if r[col] is not None], tol)
+    cpks = [v["cpk"] for v in (out["width"], out["height"]) if v["cpk"] is not None]
+    out["cpk"] = min(cpks) if cpks else None
+    return out
+
+
 @app.get("/api/machines")
 def api_machines():
     now = time.time()
@@ -140,7 +274,7 @@ def api_machines():
 # ==========================================================================
 @app.post("/api/cameras")
 async def create_camera(name: str = Form(...), machine_id: Optional[int] = Form(None)):
-    api_key = "CAM-" + secrets.token_hex(3).upper()
+    api_key = "CAM-" + secrets.token_hex(6).upper()     # 48 bits: not guessable on a LAN
     camera_id = db.create_camera(name, machine_id, api_key)
     await manager.broadcast({"type": "state_changed"})
     return {"id": camera_id, "api_key": api_key}
@@ -169,18 +303,20 @@ async def remove_camera(camera_id: int):
 
 
 @app.post("/api/cameras/{camera_id}/reference")
-async def set_reference(camera_id: int, image: UploadFile = File(...)):
+async def set_reference(camera_id: int, image: UploadFile = File(...),
+                        width_mm: Optional[float] = Form(None), height_mm: Optional[float] = Form(None)):
     camera = db.get_camera(camera_id)
     if camera is None:
         raise HTTPException(404, "Camera not found")
 
-    image_bytes = await image.read()
-    result = vision.measure_from_bytes(image_bytes)
+    image_bytes = await _read_upload(image)
+    result = await run_in_threadpool(vision.measure_from_bytes, image_bytes)
     if not result.ok:
         raise HTTPException(422, f"Could not measure the reference part: {result.error}")
 
     filename = _save_image(f"REF_C{camera_id}", result.annotated_jpeg or image_bytes)
     db.set_camera_reference(camera_id, filename, result.width_px, result.height_px)
+    db.set_camera_nominal(camera_id, width_mm, height_mm)
     await manager.broadcast({"type": "state_changed"})
     return {"ok": True, "width_px": result.width_px, "height_px": result.height_px,
             "image_url": f"/api/images/{filename}"}
@@ -214,7 +350,12 @@ def api_camera_history(camera_id: int, limit: int = 25):
 async def _run_inspection(camera: dict, image_bytes: bytes) -> dict:
     """Measure one photo against the camera's reference, store it, broadcast it."""
     machine = db.get_machine(camera["machine_id"])
-    result = vision.measure_from_bytes(image_bytes)
+    result = await run_in_threadpool(vision.measure_from_bytes, image_bytes)
+    if result.code == "no_part":
+        # Empty frame (timer fired between parts, sensor false-trigger...). That is not a
+        # failed part, so it is neither stored nor alerted.
+        return {"type": "no_part", "result": "NO_PART", "camera_id": camera["id"],
+                "message": result.error}
 
     raw_history = db.recent_inspections(camera["id"], TREND_WINDOW_SIZE)
     history = []
@@ -234,7 +375,14 @@ async def _run_inspection(camera: dict, image_bytes: bytes) -> dict:
 
     filename = _save_image(f"C{camera['id']}", result.annotated_jpeg or image_bytes)
 
+    mm_per_px = (camera["nominal_width_mm"] / camera["reference_width_px"]
+                 if camera.get("nominal_width_mm") and camera.get("reference_width_px") else None)
+    width_mm = round(result.width_px * mm_per_px, 3) if (mm_per_px and result.width_px) else None
+    height_mm = (round(result.height_px * (camera["nominal_height_mm"] / camera["reference_height_px"]), 3)
+                 if camera.get("nominal_height_mm") and camera.get("reference_height_px") and result.height_px else None)
+
     row_id = db.insert_inspection(
+        width_mm=width_mm, height_mm=height_mm,
         camera_id=camera["id"], machine_id=machine["id"],
         width_px=result.width_px, height_px=result.height_px,
         width_error_pct=diag.width_error_pct, height_error_pct=diag.height_error_pct,
@@ -248,6 +396,7 @@ async def _run_inspection(camera: dict, image_bytes: bytes) -> dict:
         "camera_id": camera["id"], "camera_name": camera["name"],
         "ts": time.time(),
         "width_px": result.width_px, "height_px": result.height_px,
+        "width_mm": width_mm, "height_mm": height_mm,
         "width_error_pct": diag.width_error_pct, "height_error_pct": diag.height_error_pct,
         "error_pct": diag.error_pct, "max_error_percent": machine["max_error_percent"],
         "result": diag.result, "diagnosis": diag.diagnosis,
@@ -268,7 +417,7 @@ async def inspect(api_key: str = Form(...), image: UploadFile = File(...)):
     if camera["machine_id"] is None:
         raise HTTPException(409, f"Camera '{camera['name']}' is not assigned to any machine yet. "
                                   f"Assign it from the dashboard's Admin panel.")
-    return JSONResponse(await _run_inspection(camera, await image.read()))
+    return JSONResponse(await _run_inspection(camera, await _read_upload(image)))
 
 
 # ==========================================================================
@@ -298,6 +447,7 @@ async def device_poll(api_key: str):
         "has_reference": camera.get("reference_image_path") is not None,
         "auto_enabled": bool(camera.get("auto_enabled")),
         "auto_interval_sec": camera.get("auto_interval_sec") or 10,
+        "mode": camera.get("trigger_mode") or "timer",   # "timer" | "sensor" (photo-eye triggered)
     }
 
 
@@ -309,7 +459,7 @@ async def device_photo(api_key: str, image: UploadFile = File(...)):
     if camera is None:
         raise HTTPException(404, "Unknown api_key")
     db.touch_camera(camera["id"])
-    data = await image.read()
+    data = await _read_upload(image)
     if len(data) < 500:
         raise HTTPException(400, "Empty image")
     filename = _save_image(f"PREV_C{camera['id']}", data)
@@ -331,17 +481,19 @@ async def request_capture(camera_id: int):
 
 
 @app.post("/api/cameras/{camera_id}/preview/use-as-reference")
-async def preview_as_reference(camera_id: int):
+async def preview_as_reference(camera_id: int, width_mm: Optional[float] = Form(None),
+                               height_mm: Optional[float] = Form(None)):
     camera = db.get_camera(camera_id)
     if camera is None or not camera.get("preview_image_path"):
         raise HTTPException(404, "No preview photo for this camera yet")
     with open(os.path.join(IMAGE_DIR, camera["preview_image_path"]), "rb") as f:
         data = f.read()
-    result = vision.measure_from_bytes(data)
+    result = await run_in_threadpool(vision.measure_from_bytes, data)
     if not result.ok:
         raise HTTPException(422, f"Could not measure the part in this photo: {result.error}")
     filename = _save_image(f"REF_C{camera_id}", result.annotated_jpeg or data)
     db.set_camera_reference(camera_id, filename, result.width_px, result.height_px)
+    db.set_camera_nominal(camera_id, width_mm, height_mm)
     db.clear_preview(camera_id)
     await manager.broadcast({"type": "state_changed"})
     return {"ok": True, "width_px": result.width_px, "height_px": result.height_px,
@@ -376,14 +528,28 @@ async def discard_preview(camera_id: int):
 
 
 @app.post("/api/cameras/{camera_id}/auto")
-async def set_auto_test(camera_id: int, enabled: bool = Form(...), interval_sec: int = Form(10)):
+async def set_auto_test(camera_id: int, enabled: bool = Form(...), interval_sec: int = Form(10),
+                        mode: str = Form("timer")):
     """Dashboard timer: camera takes + sends a test photo every N seconds."""
     if db.get_camera(camera_id) is None:
         raise HTTPException(404, "Camera not found")
     interval_sec = max(2, min(interval_sec, 3600))
-    db.set_auto(camera_id, enabled, interval_sec)
+    if mode not in ("timer", "sensor"):
+        raise HTTPException(422, "mode must be 'timer' or 'sensor'")
+    db.set_auto(camera_id, enabled, interval_sec, mode)
     await manager.broadcast({"type": "state_changed"})
-    return {"ok": True, "enabled": enabled, "interval_sec": interval_sec}
+    return {"ok": True, "enabled": enabled, "interval_sec": interval_sec, "mode": mode}
+
+
+@app.get("/api/cameras/{camera_id}/capability")
+def api_capability(camera_id: int, n: int = 30):
+    """Spread and Cpk of the last n readings. With the SAME part left untouched under the camera
+    this is a repeatability test of the gauge: if 6 sigma uses more than ~30 % of the tolerance band,
+    the camera set-up is not good enough to enforce that tolerance."""
+    camera = db.get_camera(camera_id)
+    if camera is None:
+        raise HTTPException(404, "Camera not found")
+    return _capability(camera, max(5, min(n, 500)))
 
 
 @app.get("/api/feed")
@@ -393,6 +559,8 @@ def api_feed(limit: int = 50):
 
 @app.get("/api/images/{filename}")
 def api_image(filename: str):
+    if filename != os.path.basename(filename) or "\\" in filename or ".." in filename:
+        raise HTTPException(404, "Image not found")           # no path traversal (esp. on Windows)
     path = os.path.join(IMAGE_DIR, filename)
     if not os.path.isfile(path):
         raise HTTPException(404, "Image not found")

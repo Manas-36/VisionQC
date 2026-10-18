@@ -125,6 +125,11 @@
     </div>
     <p class="hint">Place the good sample in front of the camera. If the photo looks right, use it as the reference.</p>
     <img id="preview-img" src="" alt="Photo from camera" style="width:100%;border-radius:8px;border:1px solid var(--border)">
+    <div class="hint" style="margin-top:12px">Optional but recommended: real size of this part, so results are also shown in millimetres.</div>
+    <div style="display:flex;gap:10px;margin-top:6px;flex-wrap:wrap" class="hint">
+      <label>Longer side <input id="preview-w-mm" type="number" step="0.01" min="0" class="interval-input" style="width:80px"> mm</label>
+      <label>Shorter side <input id="preview-h-mm" type="number" step="0.01" min="0" class="interval-input" style="width:80px"> mm</label>
+    </div>
     <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:14px;align-items:center">
       <button id="preview-ref-btn" class="primary-btn">Use as reference</button>
       <button id="preview-test-btn" class="ghost-btn">Test against reference</button>

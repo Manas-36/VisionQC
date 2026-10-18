@@ -17,7 +17,12 @@ from typing import Optional
 import cv2
 import numpy as np
 
-MIN_CONTOUR_AREA_PX = 800
+MIN_AREA_FRACTION = 0.005      # part must cover >= 0.5 % of the frame
+MIN_CONTRAST = 25              # min grey-level gap between part and background
+MIN_FOCUS = 5.0                # variance of Laplacian below this = out of focus
+DARK_P99 = 40                  # brightest 1 % of pixels below this = scene far too dark
+SATURATED_FRACTION = 0.98      # >98 % of pixels blown out = nothing measurable
+BORDER_MARGIN_PX = 2
 
 
 @dataclass
@@ -27,39 +32,85 @@ class MeasurementResult:
     height_px: Optional[float] = None
     error: Optional[str] = None
     annotated_jpeg: Optional[bytes] = None
+    # "ok"         part measured
+    # "no_part"    frame is empty (normal on a timer/trigger - NOT a failed part)
+    # "bad_image"  camera problem: too dark/bright, blurry, undecodable, part cut off by frame edge
+    code: str = "ok"
+
+
+def _bad(msg, frame=None, code="bad_image"):
+    return MeasurementResult(ok=False, error=msg, code=code, annotated_jpeg=_encode(frame) if frame is not None else None)
 
 
 def measure_from_bytes(image_bytes: bytes, compare_box=None) -> MeasurementResult:
-    """compare_box, if given, is (ref_w_px, ref_h_px) and is only used to
-    draw a translucent reference outline on the annotated image for a
-    quick visual sanity check — it does not affect the measurement."""
+    """Measure the part in a photo: long side and short side in pixels.
+
+    Pipeline: decode -> quality gates (exposure, focus) -> Gaussian blur ->
+    Otsu threshold (adapts to lighting, no hand-tuned Canny numbers) ->
+    auto-detect polarity (dark part on light background or the reverse,
+    decided from the frame border) -> morphological clean-up -> external
+    contours -> drop anything touching the frame edge -> largest remaining
+    blob -> rotated bounding rectangle.
+    """
     arr = np.frombuffer(image_bytes, dtype=np.uint8)
     frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if frame is None:
-        return MeasurementResult(ok=False, error="Could not decode image (corrupt or unsupported format).")
+        return _bad("Could not decode image (corrupt or unsupported format).")
 
+    h, w = frame.shape[:2]
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    # (A backlit stage legitimately has a very bright background, so only reject
+    # extreme cases rather than using a mean-brightness window.)
+    if float(np.percentile(gray, 99)) < DARK_P99:
+        return _bad("Image is too dark - check the light source.", frame)
+    if float((gray >= 250).mean()) > SATURATED_FRACTION:
+        return _bad("Image is over-exposed - reduce light or exposure.", frame)
+
+    if float(gray.std()) < 8:                       # flat frame: nothing in view
+        return _bad("No part in view.", frame, code="no_part")
+
+    if cv2.Laplacian(gray, cv2.CV_64F).var() < MIN_FOCUS:
+        return _bad("Image is out of focus - turn the lens ring / clean the lens.", frame)
+
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blur, 50, 150)
-    edges = cv2.dilate(edges, None, iterations=1)
+    thr, binary = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # Background = whatever dominates the frame border; make the part white.
+    border = np.concatenate([binary[0, :], binary[-1, :], binary[:, 0], binary[:, -1]])
+    if border.mean() > 127:
+        binary = cv2.bitwise_not(binary)
+
+    fg, bg = blur[binary > 0], blur[binary == 0]
+    if fg.size == 0 or bg.size == 0 or abs(float(fg.mean()) - float(bg.mean())) < MIN_CONTRAST:
+        return _bad("No part in view (contrast too low).", frame, code="no_part")
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    min_area = MIN_AREA_FRACTION * w * h
+    contours = [c for c in contours if cv2.contourArea(c) >= min_area]
     if not contours:
-        return MeasurementResult(ok=False, error="No part edges detected — check lighting/focus/placement.",
-                                  annotated_jpeg=_encode(frame))
+        return _bad("No part in view.", frame, code="no_part")
 
-    largest = max(contours, key=cv2.contourArea)
-    if cv2.contourArea(largest) < MIN_CONTOUR_AREA_PX:
-        return MeasurementResult(ok=False, error="Detected object too small — no part present, or contrast too low.",
-                                  annotated_jpeg=_encode(frame))
+    def touches_border(c):
+        x, y, cw, ch = cv2.boundingRect(c)
+        m = BORDER_MARGIN_PX
+        return x <= m or y <= m or x + cw >= w - m or y + ch >= h - m
 
+    inside = [c for c in contours if not touches_border(c)]
+    if not inside:
+        return _bad("Part touches the edge of the frame - it is cut off. Move the camera back or re-centre the part.", frame)
+
+    largest = max(inside, key=cv2.contourArea)
     rect = cv2.minAreaRect(largest)
-    (w_px, h_px) = rect[1]
-    w_px, h_px = max(w_px, h_px), min(w_px, h_px)
+    w_px, h_px = max(rect[1]), min(rect[1])
 
     box = cv2.boxPoints(rect).astype(int)
     cv2.drawContours(frame, [box], 0, (0, 215, 255), 2)
-    cv2.putText(frame, f"{w_px:.0f} x {h_px:.0f} px", (15, 30),
+    cv2.putText(frame, f"{w_px:.1f} x {h_px:.1f} px", (15, 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 215, 255), 2)
 
     return MeasurementResult(ok=True, width_px=w_px, height_px=h_px, annotated_jpeg=_encode(frame))

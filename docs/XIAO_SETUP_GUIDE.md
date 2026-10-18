@@ -4,7 +4,8 @@
 - Seeed XIAO ESP32S3 **Sense** (with the camera board clipped on)
 - USB-C data cable, laptop with Arduino IDE 2.x
 - The hub running on the laptop (`python -m uvicorn app:app --host 0.0.0.0 --port 8000`)
-- Laptop and XIAO on the **same WiFi** (2.4 GHz only - ESP32 can't use 5 GHz; a phone hotspot works)
+- Laptop and XIAO on the **same WiFi** (2.4 GHz only - ESP32 can't use 5 GHz; a phone hotspot works for a demo)
+- The small U.FL antenna fitted to the board
 
 ## One-time Arduino IDE setup
 1. File -> Preferences -> "Additional boards manager URLs": add
@@ -20,10 +21,22 @@
 3. Select the XIAO's COM port, click Upload. If upload fails: hold the **B** (boot) button, tap **R** (reset), release B, upload again.
 4. Open Serial Monitor at 115200. You should see "Connected. Camera IP: ...". The dashboard card turns **Online** within ~2 s.
 
+## Hub address
+In the dashboard: Admin -> Cameras shows **"Cameras connect to: http://<ip>:8000"**. Use exactly that as `HUB_URL`
+(never `localhost` or `0.0.0.0`). It changes if the computer joins another network - on a real line give the
+hub a fixed IP (DHCP reservation).
+
 ## Using it
 1. **Set the reference:** put a good part in front of the camera, press **Capture photo** on the camera card. Within ~3 s a window pops up with the photo -> **Use as reference**.
 2. **Test once:** put another part in view, press Capture photo -> **Test against reference**.
-3. **Automatic:** tick **Auto-test every [N] s** on the card (needs a reference). The camera now takes and sends a photo every N seconds on its own; results, alerts and history appear as normal. Untick to stop.
+3. **Automatic:** tick **Auto-test** on the card (needs a reference) and choose:
+   - **every N s** - timer, for bench/demo;
+   - **on sensor** - a photo-eye on pin **D1** fires one photo per part (use this on a real line; see
+     `docs/HARDWARE_AND_WIRING.md` for wiring and the opto-isolator for 24 V sensors).
+   Empty frames are ignored (not counted as failures). Untick to stop.
+4. **Millimetres:** when you press *Use as reference*, enter the part's real length/width so results are also shown in mm.
+5. **Is the camera good enough?** The card shows a **Cpk** badge. Leave one part untouched for ~30 shots to test repeatability
+   before trusting a tight tolerance.
 
 ## Troubleshooting
 | Symptom | Fix |
@@ -33,4 +46,5 @@
 | `unknown API key` | Key doesn't match Admin -> Cameras; recopy it. |
 | Card stays Offline | Camera not polling - check Serial Monitor. |
 | "Could not measure the part" on Use as reference | Part not in view / poor contrast; use a plain background and good light. |
+| "Image is out of focus" / "too dark" on the dashboard | Turn the lens ring until the part edge is sharp, add backlight. |
 | Image dark or blurry | Add light, wipe lens, focus by turning the lens ring on the OV2640 module. |

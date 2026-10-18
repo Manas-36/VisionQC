@@ -11,6 +11,11 @@ const state = {
 const MAX_ALERTS = 25;
 const MAX_FEED = 60;
 
+// Names/locations/diagnoses are user- or camera-supplied text: always escape before putting into innerHTML.
+function esc(s) {
+  return String(s === null || s === undefined ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
 function fmt(n, d = 2) { return (n === null || n === undefined) ? '--' : Number(n).toFixed(d); }
 function timeAgo(ts) { return new Date(ts * 1000).toLocaleTimeString([], { hour12: false }); }
 function machineById(id) { return state.machines.find(m => m.id === id); }
@@ -72,8 +77,8 @@ function renderMachines() {
   container.innerHTML = state.machines.slice().sort((a, b) => a.id - b.id).map(m => `
     <section class="machine-section">
       <div class="machine-section-head">
-        <h3>${m.name}</h3>
-        <span class="loc">${m.location || ''}</span>
+        <h3>${esc(m.name)}</h3>
+        <span class="loc">${esc(m.location || '')}</span>
         <span class="tol">Max error &plusmn; ${fmt(m.max_error_percent, 1)}%</span>
       </div>
       <div class="cameras-grid">
@@ -87,6 +92,7 @@ function renderMachines() {
   container.querySelectorAll('[data-capture]').forEach(node => node.addEventListener('click', () => requestCapture(Number(node.dataset.capture), node)));
   container.querySelectorAll('[data-review-preview]').forEach(node => node.addEventListener('click', () => openPreviewModal(Number(node.dataset.reviewPreview))));
   container.querySelectorAll('[data-auto-toggle]').forEach(node => node.addEventListener('change', () => saveAuto(Number(node.dataset.autoToggle))));
+  container.querySelectorAll('[data-auto-mode]').forEach(node => node.addEventListener('change', () => saveAuto(Number(node.dataset.autoMode))));
   container.querySelectorAll('[data-auto-interval]').forEach(node => node.addEventListener('change', () => saveAuto(Number(node.dataset.autoInterval))));
 }
 
@@ -103,6 +109,7 @@ async function saveAuto(cameraId) {
   const fd = new FormData();
   fd.append('enabled', toggle.checked ? 'true' : 'false');
   fd.append('interval_sec', interval.value || '10');
+  fd.append('mode', document.querySelector(`[data-auto-mode="${cameraId}"]`).value);
   await fetch(`/api/cameras/${cameraId}/auto`, { method: 'POST', body: fd });
 }
 
@@ -111,7 +118,7 @@ function openPreviewModal(cameraId) {
   const c = cameraById(cameraId);
   if (!c || !c.preview_image_path) return;
   previewCameraId = cameraId;
-  document.getElementById('preview-title').textContent = `New photo — ${c.name}`;
+  document.getElementById('preview-title').textContent = `New photo — ${esc(c.name)}`;
   document.getElementById('preview-img').src = `/api/images/${c.preview_image_path}`;
   document.getElementById('preview-status').textContent = '';
   document.getElementById('preview-test-btn').disabled = !c.has_reference;
@@ -120,22 +127,33 @@ function openPreviewModal(cameraId) {
 function closePreviewModal() { document.getElementById('preview-modal').classList.add('hidden'); previewCameraId = null; }
 document.getElementById('preview-close').addEventListener('click', closePreviewModal);
 
-async function previewAction(path, okText) {
+async function previewAction(path, okText, body) {
   const status = document.getElementById('preview-status');
   status.textContent = 'Working…';
-  const res = await fetch(`/api/cameras/${previewCameraId}/preview/${path}`, { method: 'POST' });
+  const res = await fetch(`/api/cameras/${previewCameraId}/preview/${path}`, { method: 'POST', body });
   const data = await res.json().catch(() => ({}));
   if (res.ok) { status.textContent = okText(data); setTimeout(closePreviewModal, 1200); }
   else status.textContent = data.detail || 'Failed';
 }
-document.getElementById('preview-ref-btn').addEventListener('click', () =>
-  previewAction('use-as-reference', d => `Reference set: ${d.width_px.toFixed(0)} x ${d.height_px.toFixed(0)} px`));
+document.getElementById('preview-ref-btn').addEventListener('click', () => {
+  const fd = new FormData();
+  const w = document.getElementById('preview-w-mm').value, h = document.getElementById('preview-h-mm').value;
+  if (w) fd.append('width_mm', w);
+  if (h) fd.append('height_mm', h);
+  previewAction('use-as-reference', d => `Reference set: ${d.width_px.toFixed(0)} x ${d.height_px.toFixed(0)} px`, fd);
+});
 document.getElementById('preview-test-btn').addEventListener('click', () =>
   previewAction('test', d => `${d.result}: ${d.error_pct === null ? '--' : d.error_pct.toFixed(2)}% error`));
 document.getElementById('preview-discard-btn').addEventListener('click', async () => {
   await fetch(`/api/cameras/${previewCameraId}/preview`, { method: 'DELETE' });
   closePreviewModal();
 });
+
+function cpkBadge(cap) {
+  if (!cap || cap.cpk === null || cap.cpk === undefined) return '<span class="cpk none" title="Needs at least 10 measured parts">Cpk n/a</span>';
+  const cls = cap.cpk >= 1.33 ? 'good' : (cap.cpk >= 1.0 ? 'ok' : 'bad');
+  return `<span class="cpk ${cls}" title="Process capability of the last ${cap.width.n} parts vs the tolerance. >=1.33 good, <1.0 not capable. With one part left still under the camera this is a gauge-repeatability check.">Cpk ${cap.cpk.toFixed(2)}</span>`;
+}
 
 function renderCameraCard(m, c) {
   const hist = (state.history[c.id] || []).map(r => {
@@ -175,15 +193,18 @@ function renderCameraCard(m, c) {
         <span class="reading-unit">% error</span>
         ${result ? `<span class="reading-badge ${result}">${result}</span>` : ''}
       </div>
-      <div class="tolerance-line">Machine max error: &plusmn; ${fmt(m.max_error_percent, 1)}%</div>
+      ${latest && latest.width_mm !== null && latest.width_mm !== undefined
+        ? `<div class="mm-line">${fmt(latest.width_mm, 2)} &times; ${fmt(latest.height_mm, 2)} mm</div>` : ''}
+      <div class="tolerance-line">Machine max error: &plusmn; ${fmt(m.max_error_percent, 1)}%
+        &middot; ${cpkBadge(c.capability)}</div>
       <div class="spark-wrap">
         <div class="spark-label">Last ${hist.length} readings vs. tolerance band</div>
         ${sparklineSVG(hist, m.max_error_percent)}
       </div>
       ${latest && latest.diagnosis ? `
         <div class="diagnosis-box ${severity}">
-          <div class="d-title">${latest.diagnosis}</div>
-          <div class="d-rec">${latest.recommendation || ''}</div>
+          <div class="d-title">${esc(latest.diagnosis)}</div>
+          <div class="d-rec">${esc(latest.recommendation || '')}</div>
         </div>` : `<div class="diagnosis-box"><div class="d-title">Waiting for first inspection…</div></div>`}
     `;
   }
@@ -191,7 +212,7 @@ function renderCameraCard(m, c) {
   return `
     <div class="camera-card ${result === 'FAIL' ? 'state-fail' : ''}" id="card-${c.id}">
       <div class="camera-card-head">
-        <p class="camera-name">${c.name}</p>
+        <p class="camera-name">${esc(c.name)}</p>
         <span class="status-pill ${c.online ? 'online' : ''}"><span class="dot"></span>${c.online ? 'Online' : 'Offline'}</span>
       </div>
       ${body}
@@ -199,8 +220,12 @@ function renderCameraCard(m, c) {
         <button class="ghost-btn accent-btn" data-capture="${c.id}" ${c.online ? '' : 'title="Camera is offline - the request will wait until it connects"'}>&#128247; Capture photo</button>
         ${c.has_preview ? `<button class="ghost-btn" data-review-preview="${c.id}">Review new photo</button>` : ''}
         <div class="auto-box">
-          <label class="switch-label"><input type="checkbox" data-auto-toggle="${c.id}" ${c.auto_enabled ? 'checked' : ''} ${c.has_reference && c.machine_id ? '' : 'disabled title="Set a reference first"'}> Auto-test every</label>
-          <input type="number" min="2" max="3600" value="${c.auto_interval_sec || 10}" class="interval-input" data-auto-interval="${c.id}"> s
+          <label class="switch-label"><input type="checkbox" data-auto-toggle="${c.id}" ${c.auto_enabled ? 'checked' : ''} ${c.has_reference && c.machine_id ? '' : 'disabled title="Set a reference first"'}> Auto-test</label>
+          <select class="interval-input" data-auto-mode="${c.id}" title="Timer = every N seconds (bench/demo). Sensor = when the photo-eye sees a part (real line).">
+            <option value="timer" ${c.trigger_mode !== 'sensor' ? 'selected' : ''}>every</option>
+            <option value="sensor" ${c.trigger_mode === 'sensor' ? 'selected' : ''}>on sensor</option>
+          </select>
+          <input type="number" min="2" max="3600" value="${c.auto_interval_sec || 10}" class="interval-input" data-auto-interval="${c.id}" ${c.trigger_mode === 'sensor' ? 'disabled' : ''}> s
         </div>
       </div>
       <div class="card-footer">
@@ -218,9 +243,9 @@ function renderAlerts() {
     <div class="alert-row">
       <div class="alert-sev ${a.severity}"></div>
       <div class="alert-body">
-        <span class="alert-machine">${a.camera_name} &middot; ${a.machine_name}</span><span class="alert-time">${timeAgo(a.ts)}</span>
-        <div class="alert-text">${a.diagnosis}</div>
-        <div class="alert-rec">${a.recommendation}</div>
+        <span class="alert-machine">${esc(a.camera_name)} &middot; ${esc(a.machine_name)}</span><span class="alert-time">${timeAgo(a.ts)}</span>
+        <div class="alert-text">${esc(a.diagnosis)}</div>
+        <div class="alert-rec">${esc(a.recommendation)}</div>
       </div>
     </div>
   `).join('');
@@ -230,7 +255,7 @@ function renderFeed() {
   document.getElementById('feed-list').innerHTML = state.feed.slice(0, MAX_FEED).map(f => `
     <div class="feed-row">
       <span class="feed-time">${timeAgo(f.ts)}</span>
-      <span class="feed-machine">${f.camera_name || f.machine_name}</span>
+      <span class="feed-machine">${esc(f.camera_name || f.machine_name)}</span>
       <span class="feed-value">${f.error_pct !== null && f.error_pct !== undefined ? fmt(f.error_pct) + '%' : '--'}</span>
       <span class="feed-badge ${f.result}">${f.result}</span>
     </div>
@@ -245,6 +270,9 @@ document.getElementById('image-modal-close').addEventListener('click', () => doc
 document.getElementById('image-modal').addEventListener('click', (e) => { if (e.target.id === 'image-modal') e.target.classList.add('hidden'); });
 
 async function loadAll() {
+  if (!state.hubUrl) {
+    try { state.hubUrl = (await fetch('/api/hub-info').then(r => r.json())).camera_hub_url; } catch (e) {}
+  }
   state.machines = await fetch('/api/machines').then(r => r.json());
   state.cameras = state.machines.flatMap(m => m.cameras);
   for (const c of state.cameras) {
@@ -270,6 +298,11 @@ function connectWS() {
   ws.onmessage = async (evt) => {
     const msg = JSON.parse(evt.data);
     if (msg.type === 'state_changed') { await loadAll(); return; }
+    if (msg.type === 'camera_offline') {
+      beep();
+      showToast(`Camera OFFLINE — ${msg.camera_name}`, `${msg.machine_name || 'Unassigned'}: no signal. Parts are NOT being inspected. Check power / WiFi.`);
+      await loadAll(); return;
+    }
     if (msg.type === 'preview') { await loadAll(); openPreviewModal(msg.camera_id); return; }
     if (msg.type !== 'inspection') return;
 
@@ -310,7 +343,9 @@ function showToast(title, body) {
   const stack = document.getElementById('toast-stack');
   const toast = document.createElement('div');
   toast.className = 'toast';
-  toast.innerHTML = `<div class="t-title">${title}</div><div class="t-body">${body}</div>`;
+  const t = document.createElement('div'); t.className = 't-title'; t.textContent = title;
+  const b = document.createElement('div'); b.className = 't-body'; b.textContent = body;
+  toast.append(t, b);
   stack.appendChild(toast);
   setTimeout(() => toast.remove(), 6000);
 }
@@ -352,8 +387,8 @@ function renderAdminMachines() {
   list.innerHTML = state.machines.map(m => `
     <div class="admin-row">
       <div class="admin-row-main">
-        <div class="name">${m.name}</div>
-        <div class="meta">${m.location || 'No location set'} &middot; ${m.cameras.length} camera(s)</div>
+        <div class="name">${esc(m.name)}</div>
+        <div class="meta">${esc(m.location || 'No location set')} &middot; ${m.cameras.length} camera(s)</div>
       </div>
       <label style="display:flex;align-items:center;gap:5px;color:var(--text-mute);font-size:11px;">
         Max error
@@ -379,15 +414,16 @@ function renderAdminMachines() {
 function renderAdminCameras() {
   const list = document.getElementById('admin-cameras-list');
   if (!state.cameras.length) { list.innerHTML = `<p class="empty-state">No cameras added yet.</p>`; return; }
-  list.innerHTML = state.cameras.map(c => `
+  list.innerHTML = `<p class="hint-text">Cameras connect to: <b>${esc(state.hubUrl || '')}</b> &mdash; use this as HUB_URL
+    (not localhost / 0.0.0.0). It changes if this computer joins a different network.</p>` + state.cameras.map(c => `
     <div class="admin-row">
       <div class="admin-row-main">
-        <div class="name"><span class="tiny-status ${c.online ? 'online' : ''}"></span> ${c.name}</div>
+        <div class="name"><span class="tiny-status ${c.online ? 'online' : ''}"></span> ${esc(c.name)}</div>
         <div class="meta"><span class="token-badge">${c.api_key}</span> &middot; ${c.has_reference ? 'reference set' : 'no reference yet'}</div>
       </div>
       <select data-reassign-camera="${c.id}">
         <option value="">Unassigned</option>
-        ${state.machines.map(m => `<option value="${m.id}" ${c.machine_id === m.id ? 'selected' : ''}>${m.name}</option>`).join('')}
+        ${state.machines.map(m => `<option value="${m.id}" ${c.machine_id === m.id ? 'selected' : ''}>${esc(m.name)}</option>`).join('')}
       </select>
       <button class="text-link" data-set-reference="${c.id}">Reference</button>
       <button class="danger-btn" data-delete-camera="${c.id}">Delete</button>
@@ -411,7 +447,7 @@ function renderAdminCameras() {
 function populateCameraMachineSelect() {
   const sel = document.querySelector('#add-camera-form select[name="machine_id"]');
   const current = sel.value;
-  sel.innerHTML = `<option value="">Unassigned for now</option>` + state.machines.map(m => `<option value="${m.id}">${m.name}</option>`).join('');
+  sel.innerHTML = `<option value="">Unassigned for now</option>` + state.machines.map(m => `<option value="${m.id}">${esc(m.name)}</option>`).join('');
   sel.value = current;
 }
 
@@ -429,7 +465,7 @@ document.getElementById('add-camera-form').addEventListener('submit', async (e) 
   const res = await fetch('/api/cameras', { method: 'POST', body: new FormData(form) });
   const data = await res.json();
   form.reset();
-  showToast('Camera added', `API key: ${data.api_key} — use this in the machine-node script or ESP32-CAM firmware.`);
+  showToast('Camera added', `API key: ${data.api_key}   |   HUB_URL: ${state.hubUrl || 'http://<this-computer-ip>:8000'}   (put both in the camera's secrets.h)`);
 });
 
 function openReferenceModal(cameraId) {

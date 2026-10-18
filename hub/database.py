@@ -66,9 +66,11 @@ CREATE INDEX IF NOT EXISTS idx_inspections_machine_ts ON inspections (machine_id
 
 @contextmanager
 def get_conn():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")      # readers don't block the writer
+    conn.execute("PRAGMA busy_timeout = 10000")
     try:
         yield conn
         conn.commit()
@@ -82,6 +84,14 @@ NEW_CAMERA_COLUMNS = {
     "pending_command":    "TEXT",
     "preview_image_path": "TEXT",
     "preview_at":         "REAL",
+    "nominal_width_mm":   "REAL",    # real size of the reference part (longer side)
+    "nominal_height_mm":  "REAL",    # real size of the reference part (shorter side)
+    "trigger_mode":       "TEXT NOT NULL DEFAULT 'timer'",   # 'timer' | 'sensor'
+}
+
+NEW_INSPECTION_COLUMNS = {
+    "width_mm":  "REAL",
+    "height_mm": "REAL",
 }
 
 
@@ -89,10 +99,11 @@ def init_db():
     with get_conn() as conn:
         conn.executescript(SCHEMA)
         # light migration so older hub.db files keep working
-        have = {r["name"] for r in conn.execute("PRAGMA table_info(cameras)")}
-        for col, decl in NEW_CAMERA_COLUMNS.items():
-            if col not in have:
-                conn.execute(f"ALTER TABLE cameras ADD COLUMN {col} {decl}")
+        for table, wanted in (("cameras", NEW_CAMERA_COLUMNS), ("inspections", NEW_INSPECTION_COLUMNS)):
+            have = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+            for col, decl in wanted.items():
+                if col not in have:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
 
 
 # --------------------------------------------------------------- machines
@@ -164,7 +175,7 @@ def clear_camera_reference(camera_id):
     with get_conn() as conn:
         conn.execute(
             "UPDATE cameras SET reference_image_path=NULL, reference_width_px=NULL, "
-            "reference_height_px=NULL, reference_set_at=NULL WHERE id=?",
+            "reference_height_px=NULL, reference_set_at=NULL, nominal_width_mm=NULL, nominal_height_mm=NULL WHERE id=?",
             (camera_id,),
         )
 
@@ -174,10 +185,16 @@ def set_pending_command(camera_id, command):
         conn.execute("UPDATE cameras SET pending_command=? WHERE id=?", (command, camera_id))
 
 
-def set_auto(camera_id, enabled, interval_sec):
+def set_auto(camera_id, enabled, interval_sec, mode="timer"):
     with get_conn() as conn:
-        conn.execute("UPDATE cameras SET auto_enabled=?, auto_interval_sec=? WHERE id=?",
-                     (1 if enabled else 0, int(interval_sec), camera_id))
+        conn.execute("UPDATE cameras SET auto_enabled=?, auto_interval_sec=?, trigger_mode=? WHERE id=?",
+                     (1 if enabled else 0, int(interval_sec), mode, camera_id))
+
+
+def set_camera_nominal(camera_id, width_mm, height_mm):
+    with get_conn() as conn:
+        conn.execute("UPDATE cameras SET nominal_width_mm=?, nominal_height_mm=? WHERE id=?",
+                     (width_mm, height_mm, camera_id))
 
 
 def set_preview(camera_id, image_path):
@@ -219,14 +236,15 @@ def list_cameras(machine_id=None):
 
 # --------------------------------------------------------------- inspections
 def insert_inspection(camera_id, machine_id, width_px, height_px, width_error_pct, height_error_pct,
-                       error_pct, result, diagnosis, recommendation, severity, image_path):
+                       error_pct, result, diagnosis, recommendation, severity, image_path,
+                       width_mm=None, height_mm=None):
     with get_conn() as conn:
         cur = conn.execute(
             "INSERT INTO inspections (camera_id, machine_id, ts, width_px, height_px, width_error_pct, "
-            "height_error_pct, error_pct, result, diagnosis, recommendation, severity, image_path) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "height_error_pct, error_pct, result, diagnosis, recommendation, severity, image_path, "
+            "width_mm, height_mm) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (camera_id, machine_id, time.time(), width_px, height_px, width_error_pct, height_error_pct,
-             error_pct, result, diagnosis, recommendation, severity, image_path),
+             error_pct, result, diagnosis, recommendation, severity, image_path, width_mm, height_mm),
         )
         return cur.lastrowid
 
@@ -266,3 +284,30 @@ def camera_stats(camera_id, window=200):
         "fails": total - passes,
         "pass_rate": round(100 * passes / total, 1) if total else None,
     }
+
+
+def prune_images(pass_days, fail_days, image_dir):
+    """Delete old inspection image files (rows/measurements are kept). Returns number removed."""
+    import os
+    now = time.time()
+    removed = 0
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, ts, result, image_path FROM inspections WHERE image_path IS NOT NULL"
+        ).fetchall()
+        for r in rows:
+            keep_days = pass_days if r["result"] == "PASS" else fail_days
+            if now - r["ts"] > keep_days * 86400:
+                try:
+                    os.remove(os.path.join(image_dir, r["image_path"]))
+                except FileNotFoundError:
+                    pass
+                conn.execute("UPDATE inspections SET image_path=NULL WHERE id=?", (r["id"],))
+                removed += 1
+    # stale unaccepted preview photos
+    for name in os.listdir(image_dir):
+        if name.startswith("PREV_"):
+            p = os.path.join(image_dir, name)
+            if now - os.path.getmtime(p) > 86400:
+                os.remove(p)
+    return removed
