@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Mobile Capture — VisionQC</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/dashboard.css">
+<style>
+  body { padding: 0; }
+  .cap-wrap { max-width: 480px; margin: 0 auto; padding: 20px 18px 60px; }
+  .cap-header { text-align: center; margin-bottom: 18px; }
+  .cap-header h1 { font-family: var(--font-display); font-size: 18px; margin: 10px 0 4px; }
+  .cap-header p { color: var(--text-mute); font-size: 12.5px; margin: 0; }
+  .cap-select { width: 100%; background: var(--panel-2); border: 1px solid var(--border); color: var(--text); padding: 12px; border-radius: 8px; font-size: 14px; margin-bottom: 16px; }
+  .cap-photo-btn { display: block; width: 100%; text-align: center; background: var(--accent); color: #1A1400; border: none; padding: 16px; border-radius: 10px; font-size: 15px; font-weight: 700; cursor: pointer; margin-bottom: 14px; }
+  .cap-photo-btn:disabled { opacity: 0.4; }
+  input[type=file] { display: none; }
+  .cap-preview-box { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 10px; margin-bottom: 14px; text-align: center; }
+  .cap-preview-box img { width: 100%; border-radius: 6px; display: block; }
+  .cap-preview-placeholder { color: var(--text-mute); font-size: 13px; padding: 40px 10px; }
+  .cap-actions { display: flex; gap: 10px; margin-bottom: 16px; }
+  .cap-actions button { flex: 1; padding: 13px; border-radius: 8px; font-size: 13.5px; font-weight: 600; cursor: pointer; border: 1px solid var(--border); }
+  .cap-btn-inspect { background: var(--pass); color: #06210F; border: none; }
+  .cap-btn-reference { background: var(--panel-2); color: var(--text); }
+  .cap-actions button:disabled { opacity: 0.35; }
+  .cap-result { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px; text-align: center; }
+  .cap-result .r-value { font-family: var(--font-mono); font-size: 40px; font-weight: 700; margin: 6px 0; }
+  .cap-result .r-badge { display: inline-block; font-family: var(--font-mono); font-weight: 700; font-size: 13px; padding: 5px 14px; border-radius: 6px; margin-bottom: 10px; }
+  .cap-result .r-badge.PASS { background: rgba(47,191,113,0.15); color: var(--pass); }
+  .cap-result .r-badge.FAIL { background: rgba(229,72,77,0.16); color: var(--fail); }
+  .cap-result .r-badge.ERROR { background: rgba(242,153,74,0.16); color: var(--warn); }
+  .cap-result .r-diag { font-size: 13px; margin-top: 8px; line-height: 1.5; text-align: left; }
+  .cap-result .r-diag .rt { font-weight: 600; margin-bottom: 4px; }
+  .cap-result .r-diag .rr { color: var(--text-mute); }
+  .cap-status { text-align: center; color: var(--text-mute); font-size: 12.5px; margin-top: 10px; }
+</style>
+</head>
+<body>
+<div class="cap-wrap">
+  <div class="cap-header">
+    <div class="logo-mark" style="margin:0 auto 8px;">&#9670;</div>
+    <h1>Mobile Capture</h1>
+    <p>Use this phone as an inspection camera</p>
+  </div>
+
+  <select id="camera-select" class="cap-select">
+    <option value="">Loading cameras…</option>
+  </select>
+
+  <label for="file-input" class="cap-photo-btn" id="photo-btn">&#128247; Take Photo</label>
+  <input type="file" id="file-input" accept="image/*" capture="environment">
+
+  <div class="cap-preview-box" id="preview-box">
+    <div class="cap-preview-placeholder">No photo yet — tap "Take Photo" above</div>
+  </div>
+
+  <div class="cap-actions">
+    <button class="cap-btn-reference" id="btn-reference" disabled>Set as Reference</button>
+    <button class="cap-btn-inspect" id="btn-inspect" disabled>Run Inspection</button>
+  </div>
+
+  <div id="result-box"></div>
+  <p class="cap-status" id="status-line"></p>
+</div>
+
+<script>
+let cameras = [];
+let currentFile = null;
+
+async function loadCameras() {
+  const machines = await fetch('/api/machines').then(r => r.json());
+  cameras = machines.flatMap(m => m.cameras.map(c => ({ ...c, machine_name: m.name })));
+  const sel = document.getElementById('camera-select');
+  if (!cameras.length) {
+    sel.innerHTML = '<option value="">No cameras yet — add one in Admin first</option>';
+    return;
+  }
+  sel.innerHTML = cameras.map(c => `<option value="${c.id}">${c.name} — ${c.machine_name}${c.has_reference ? '' : ' (no reference yet)'}</option>`).join('');
+}
+
+document.getElementById('file-input').addEventListener('change', (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  currentFile = file;
+  const box = document.getElementById('preview-box');
+  box.innerHTML = `<img src="${URL.createObjectURL(file)}">`;
+  document.getElementById('btn-reference').disabled = false;
+  document.getElementById('btn-inspect').disabled = false;
+  document.getElementById('result-box').innerHTML = '';
+  document.getElementById('status-line').textContent = '';
+});
+
+document.getElementById('btn-inspect').addEventListener('click', async () => {
+  const cameraId = document.getElementById('camera-select').value;
+  const camera = cameras.find(c => String(c.id) === String(cameraId));
+  if (!camera || !currentFile) return;
+  setStatus('Sending to hub…');
+  const fd = new FormData();
+  fd.append('api_key', camera.api_key);
+  fd.append('image', currentFile);
+  try {
+    const res = await fetch('/api/inspect', { method: 'POST', body: fd });
+    const data = await res.json();
+    if (!res.ok) { setStatus('Error: ' + (data.detail || 'inspection failed')); return; }
+    renderResult(data);
+    setStatus('');
+  } catch (e) {
+    setStatus('Could not reach the hub — check you\'re on the same WiFi network.');
+  }
+});
+
+document.getElementById('btn-reference').addEventListener('click', async () => {
+  const cameraId = document.getElementById('camera-select').value;
+  if (!cameraId || !currentFile) return;
+  setStatus('Uploading reference photo…');
+  const fd = new FormData();
+  fd.append('image', currentFile);
+  try {
+    const res = await fetch(`/api/cameras/${cameraId}/reference`, { method: 'POST', body: fd });
+    const data = await res.json();
+    if (!res.ok) { setStatus('Error: ' + (data.detail || 'could not set reference')); return; }
+    setStatus(`Reference set: ${data.width_px.toFixed(0)} x ${data.height_px.toFixed(0)} px`);
+    document.getElementById('result-box').innerHTML = '';
+    await loadCameras();
+  } catch (e) {
+    setStatus('Could not reach the hub — check you\'re on the same WiFi network.');
+  }
+});
+
+function renderResult(data) {
+  const box = document.getElementById('result-box');
+  const err = data.error_pct !== null && data.error_pct !== undefined ? data.error_pct.toFixed(2) : '--';
+  box.innerHTML = `
+    <div class="cap-result">
+      <span class="r-badge ${data.result}">${data.result}</span>
+      <div class="r-value">${err}<span style="font-size:18px;color:var(--text-mute);"> % error</span></div>
+      ${data.diagnosis ? `<div class="r-diag"><div class="rt">${data.diagnosis}</div><div class="rr">${data.recommendation || ''}</div></div>` : ''}
+    </div>
+  `;
+}
+
+function setStatus(text) { document.getElementById('status-line').textContent = text; }
+
+loadCameras();
+</script>
+</body>
+</html>

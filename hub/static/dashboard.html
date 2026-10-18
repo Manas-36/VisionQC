@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VisionQC — Live Floor Monitor</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/dashboard.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-left">
+    <div class="logo-mark">&#9670;</div>
+    <div>
+      <h1>VISIONQC</h1>
+      <p class="subtitle">Vision-based dimensional QC — live floor monitor</p>
+    </div>
+  </div>
+  <div class="topbar-right">
+    <a href="/capture" target="_blank" class="ghost-btn" title="Open this on a phone to use it as a camera">&#128241; Mobile capture</a>
+    <button id="notif-btn" class="ghost-btn" title="Enable desktop alerts for FAIL results">
+      <span>&#128276;</span> <span id="notif-label">Enable alerts</span>
+    </button>
+    <button id="admin-btn" class="ghost-btn accent-btn">Admin</button>
+    <div id="conn-status" class="conn-status offline">
+      <span class="dot"></span> <span id="conn-label">connecting…</span>
+    </div>
+    <div class="clock" id="clock">--:--:--</div>
+  </div>
+</header>
+
+<main>
+  <section class="summary-row" id="summary-row"></section>
+
+  <section id="empty-state" class="empty-state-panel hidden">
+    <h2>No machines yet</h2>
+    <p>Add your first machine, then add a camera and assign it to that machine. Capture a reference photo of a known-good part on that camera to start inspecting.</p>
+    <button class="primary-btn" id="empty-admin-btn">Open Admin panel</button>
+  </section>
+
+  <div id="machines-container"></div>
+
+  <section class="lower-grid">
+    <div class="panel alerts-panel">
+      <div class="panel-head">
+        <h2>ACTIVE ALERTS</h2>
+        <span class="panel-hint">Warnings &amp; critical diagnoses, most recent first</span>
+      </div>
+      <div id="alerts-list" class="alerts-list">
+        <p class="empty-state">No active alerts.</p>
+      </div>
+    </div>
+
+    <div class="panel feed-panel">
+      <div class="panel-head">
+        <h2>LIVE INSPECTION FEED</h2>
+        <span class="panel-hint">Every part measured, across all machines &amp; cameras</span>
+      </div>
+      <div id="feed-list" class="feed-list"></div>
+    </div>
+  </section>
+</main>
+
+<!-- ============================== ADMIN PANEL ============================== -->
+<div id="admin-modal" class="modal-overlay hidden">
+  <div class="modal-panel">
+    <div class="modal-head">
+      <h2>Admin</h2>
+      <button id="admin-close" class="icon-btn">&times;</button>
+    </div>
+
+    <div class="admin-tabs">
+      <button class="admin-tab active" data-tab="machines">Machines</button>
+      <button class="admin-tab" data-tab="cameras">Cameras</button>
+    </div>
+
+    <div class="admin-pane" id="tab-machines">
+      <form id="add-machine-form" class="inline-form">
+        <input type="text" name="name" placeholder="Machine name (e.g. CNC Lathe - Line 2)" required>
+        <input type="text" name="location" placeholder="Location (e.g. Bay 4)">
+        <input type="number" name="max_error_percent" placeholder="Max error %" value="2.0" step="0.1" min="0.1" style="width:110px">
+        <button type="submit" class="primary-btn">Add machine</button>
+      </form>
+      <div id="admin-machines-list" class="admin-list"></div>
+    </div>
+
+    <div class="admin-pane hidden" id="tab-cameras">
+      <form id="add-camera-form" class="inline-form">
+        <input type="text" name="name" placeholder="Camera name (e.g. Output-side cam)" required>
+        <select name="machine_id">
+          <option value="">Unassigned for now</option>
+        </select>
+        <button type="submit" class="primary-btn">Add camera</button>
+      </form>
+      <p class="hint-text">Adding a camera gives you an API key — put that key into the machine-node script or the ESP32-CAM firmware so the hub knows which photos came from which camera. It's shown once when created; you can also see it any time in this list.</p>
+      <div id="admin-cameras-list" class="admin-list"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================== REFERENCE CAPTURE MODAL ============================== -->
+<div id="reference-modal" class="modal-overlay hidden">
+  <div class="modal-panel narrow">
+    <div class="modal-head">
+      <h2 id="reference-modal-title">Set reference part</h2>
+      <button id="reference-close" class="icon-btn">&times;</button>
+    </div>
+    <p class="hint-text">Upload a photo of a known-good ("master") part seen by this camera. Every future photo from this camera is compared against it as a percentage difference.</p>
+    <input type="file" id="reference-file-input" accept="image/*">
+    <div id="reference-preview" class="reference-preview hidden">
+      <img id="reference-preview-img" src="">
+    </div>
+    <button id="reference-upload-btn" class="primary-btn" disabled>Upload &amp; measure</button>
+    <p id="reference-status" class="hint-text"></p>
+  </div>
+</div>
+
+<div id="preview-modal" class="modal-overlay hidden">
+  <div class="modal-panel">
+    <div class="modal-head">
+      <h2 id="preview-title">New photo</h2>
+      <button id="preview-close" class="ghost-btn">Close</button>
+    </div>
+    <p class="hint">Place the good sample in front of the camera. If the photo looks right, use it as the reference.</p>
+    <img id="preview-img" src="" alt="Photo from camera" style="width:100%;border-radius:8px;border:1px solid var(--border)">
+    <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:14px;align-items:center">
+      <button id="preview-ref-btn" class="primary-btn">Use as reference</button>
+      <button id="preview-test-btn" class="ghost-btn">Test against reference</button>
+      <button id="preview-discard-btn" class="ghost-btn">Discard</button>
+      <span id="preview-status" class="hint"></span>
+    </div>
+  </div>
+</div>
+
+<div id="image-modal" class="image-modal hidden">
+  <div class="image-modal-inner">
+    <img id="image-modal-img" src="" alt="Annotated inspection frame">
+    <button id="image-modal-close">Close</button>
+  </div>
+</div>
+
+<div id="toast-stack" class="toast-stack"></div>
+
+<script src="/static/dashboard.js"></script>
+</body>
+</html>

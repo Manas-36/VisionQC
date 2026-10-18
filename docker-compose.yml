@@ -1,0 +1,10 @@
+services:
+  visionqc:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - visionqc-data:/data
+    restart: unless-stopped
+volumes:
+  visionqc-data:
